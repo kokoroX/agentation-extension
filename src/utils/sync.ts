@@ -6,18 +6,54 @@
 // When an endpoint is provided, annotations sync to a server.
 // Falls back gracefully to local-only mode on network errors.
 //
+// All requests go through the background service worker (PROXY_FETCH) so that
+// host-page CSP (connect-src / https) never blocks the local MCP endpoint.
 
 import type { Annotation, Session, SessionWithAnnotations } from "../shared/types";
+import type { ProxyFetchMessage, ProxyFetchResponse } from "../shared/messages";
+
+type ProxyFetchOptions = ProxyFetchMessage["options"];
+
+function normalize(endpoint: string): string {
+  return endpoint.replace(/\/+$/, "");
+}
+
+export async function proxyFetch(
+  url: string,
+  options?: ProxyFetchOptions,
+): Promise<ProxyFetchResponse> {
+  const message: ProxyFetchMessage = { type: "PROXY_FETCH", url, options };
+  const response = await chrome.runtime.sendMessage<
+    ProxyFetchMessage,
+    ProxyFetchResponse
+  >(message);
+  if (!response) {
+    throw new Error("No response from background worker");
+  }
+  return response;
+}
+
+/**
+ * Health check against the server. Returns true when the server responds 2xx.
+ */
+export async function checkHealth(endpoint: string): Promise<boolean> {
+  try {
+    const response = await proxyFetch(`${normalize(endpoint)}/health`);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * List all sessions from the server.
  */
 export async function listSessions(endpoint: string): Promise<Session[]> {
-  const response = await fetch(`${endpoint}/sessions`);
+  const response = await proxyFetch(`${normalize(endpoint)}/sessions`);
   if (!response.ok) {
     throw new Error(`Failed to list sessions: ${response.status}`);
   }
-  return response.json();
+  return response.body as Session[];
 }
 
 /**
@@ -27,7 +63,7 @@ export async function createSession(
   endpoint: string,
   url: string
 ): Promise<Session> {
-  const response = await fetch(`${endpoint}/sessions`, {
+  const response = await proxyFetch(`${normalize(endpoint)}/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url }),
@@ -37,7 +73,7 @@ export async function createSession(
     throw new Error(`Failed to create session: ${response.status}`);
   }
 
-  return response.json();
+  return response.body as Session;
 }
 
 /**
@@ -47,13 +83,15 @@ export async function getSession(
   endpoint: string,
   sessionId: string
 ): Promise<SessionWithAnnotations> {
-  const response = await fetch(`${endpoint}/sessions/${sessionId}`);
+  const response = await proxyFetch(
+    `${normalize(endpoint)}/sessions/${sessionId}`,
+  );
 
   if (!response.ok) {
     throw new Error(`Failed to get session: ${response.status}`);
   }
 
-  return response.json();
+  return response.body as SessionWithAnnotations;
 }
 
 /**
@@ -65,17 +103,20 @@ export async function syncAnnotation(
   sessionId: string,
   annotation: Annotation
 ): Promise<Annotation> {
-  const response = await fetch(`${endpoint}/sessions/${sessionId}/annotations`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(annotation),
-  });
+  const response = await proxyFetch(
+    `${normalize(endpoint)}/sessions/${sessionId}/annotations`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(annotation),
+    },
+  );
 
   if (!response.ok) {
     throw new Error(`Failed to sync annotation: ${response.status}`);
   }
 
-  return response.json();
+  return response.body as Annotation;
 }
 
 /**
@@ -86,17 +127,20 @@ export async function updateAnnotation(
   annotationId: string,
   data: Partial<Annotation>
 ): Promise<Annotation> {
-  const response = await fetch(`${endpoint}/annotations/${annotationId}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
+  const response = await proxyFetch(
+    `${normalize(endpoint)}/annotations/${annotationId}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    },
+  );
 
   if (!response.ok) {
     throw new Error(`Failed to update annotation: ${response.status}`);
   }
 
-  return response.json();
+  return response.body as Annotation;
 }
 
 /**
@@ -106,9 +150,10 @@ export async function deleteAnnotation(
   endpoint: string,
   annotationId: string
 ): Promise<void> {
-  const response = await fetch(`${endpoint}/annotations/${annotationId}`, {
-    method: "DELETE",
-  });
+  const response = await proxyFetch(
+    `${normalize(endpoint)}/annotations/${annotationId}`,
+    { method: "DELETE" },
+  );
 
   if (!response.ok) {
     throw new Error(`Failed to delete annotation: ${response.status}`);
@@ -135,15 +180,18 @@ export async function requestAction(
   sessionId: string,
   output: string
 ): Promise<ActionResponse> {
-  const response = await fetch(`${endpoint}/sessions/${sessionId}/action`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ output }),
-  });
+  const response = await proxyFetch(
+    `${normalize(endpoint)}/sessions/${sessionId}/action`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ output }),
+    },
+  );
 
   if (!response.ok) {
     throw new Error(`Failed to request action: ${response.status}`);
   }
 
-  return response.json();
+  return response.body as ActionResponse;
 }

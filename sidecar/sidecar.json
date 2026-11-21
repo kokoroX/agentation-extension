@@ -1,0 +1,10 @@
+{
+  "display_name": "Agentation Bridge",
+  "description": "Local HTTP bridge allowing the Agentation Chrome extension to submit UI annotations directly to Antigravity conversations via agentapi.",
+  "command": "node",
+  "args": ["server.mjs"],
+  "env": {
+    "AGENTATION_BRIDGE_PORT": "4748"
+  },
+  "restart_policy": "always"
+}

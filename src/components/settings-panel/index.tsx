@@ -19,6 +19,7 @@ export type SettingsPanelProps = {
 
   connectionStatus: ConnectionStatus;
   endpoint?: string;
+  bridgeEndpoint?: string;
 
   /** Whether the panel is mounted (controls enter/exit class) */
   isVisible: boolean;
@@ -40,6 +41,7 @@ export function SettingsPanel({
   isDevMode,
   connectionStatus,
   endpoint,
+  bridgeEndpoint,
   isVisible,
   toolbarNearBottom,
   settingsPage,
@@ -300,6 +302,20 @@ export function SettingsPanel({
               >
                 Learn more
               </a>
+            </p>
+            <p
+              className={styles.automationDescription}
+              style={{ paddingBottom: 6 }}
+            >
+              {endpoint ? `Endpoint: ${endpoint}` : "Local only (no endpoint configured)"}
+            </p>
+            <p
+              className={styles.automationDescription}
+              style={{ paddingBottom: 6 }}
+            >
+              {bridgeEndpoint
+                ? `Antigravity Bridge: ${bridgeEndpoint}`
+                : "Antigravity Bridge: Disabled"}
             </p>
           </div>
 
