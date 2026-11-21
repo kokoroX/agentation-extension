@@ -19,6 +19,20 @@ pnpm build
 3. Enable **Developer mode** (top-right toggle)
 4. Click **Load unpacked** and select the `dist/` folder
 
+## Antigravity Direct Submit (Sidecar Bridge)
+
+Submit page annotations directly from the toolbar (`Send` button or `S`) or popup to the **Antigravity** desktop app while keeping `agentation-mcp` for live SSE marker resolution:
+
+1. Install the local Antigravity sidecar (`~/.gemini/config/sidecars/agentation-bridge/`):
+
+```bash
+pnpm install:sidecar
+```
+
+2. Enable **Agentation Bridge** in Antigravity's Sidecars / Automations settings (runs on `http://127.0.0.1:4748`).
+3. *(Optional, for **New Chat** mode)* Set `"projectId"` under `sidecars["agentation-bridge"]` in `~/.gemini/config/config.json`.
+4. Open the extension popup to choose **Existing Chat** (remembered per site origin) or **New Chat**, then click **Submit to Antigravity** (or press `S` on the page).
+
 ## Features
 
 - **Click to annotate** — Click any element with automatic selector identification

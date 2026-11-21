@@ -10,6 +10,13 @@
 // that uses these functions. The cache must be populated first.
 
 import type { Annotation } from "../shared/types";
+import {
+  DEFAULT_BRIDGE_ENDPOINT,
+  DEFAULT_ENDPOINT,
+  STORAGE_KEY_BRIDGE_ENDPOINT,
+  STORAGE_KEY_BRIDGE_TARGETS,
+  STORAGE_KEY_ENDPOINT,
+} from "../shared/constants";
 
 // ── In-memory cache ─────────────────────────────────────────────────────────
 
@@ -265,6 +272,76 @@ export function saveSessionId(pathname: string, sessionId: string): void {
 
 export function clearSessionId(pathname: string): void {
   cacheRemove(getSessionStorageKey(pathname));
+}
+
+// ── MCP endpoint ────────────────────────────────────────────────────────────
+
+/** Strip whitespace and trailing slashes from an endpoint URL. */
+export function normalizeEndpoint(value: string): string {
+  return value.trim().replace(/\/+$/, "");
+}
+
+/**
+ * Load the configured MCP endpoint.
+ * Returns DEFAULT_ENDPOINT when never configured, or "" when the user
+ * explicitly cleared it (local-only mode).
+ */
+export function loadEndpoint(): string {
+  const val = cacheGet<string>(STORAGE_KEY_ENDPOINT);
+  if (val === null || val === undefined) return DEFAULT_ENDPOINT;
+  if (val === "") return "";
+  return normalizeEndpoint(val);
+}
+
+/** Persist the configured MCP endpoint ("" disables syncing). */
+export function saveEndpoint(endpoint: string): void {
+  cacheSet(STORAGE_KEY_ENDPOINT, normalizeEndpoint(endpoint));
+}
+
+// ── Antigravity bridge endpoint & per-origin targets ────────────────────────
+
+export type BridgeTarget = {
+  mode: "existing" | "new";
+  projectId?: string;
+  projectName?: string;
+  projectFolder?: string;
+  conversationId?: string;
+  conversationTitle?: string;
+};
+
+/**
+ * Load the configured Antigravity Sidecar bridge endpoint.
+ * Returns DEFAULT_BRIDGE_ENDPOINT when never configured, or "" when cleared.
+ */
+export function loadBridgeEndpoint(): string {
+  const val = cacheGet<string>(STORAGE_KEY_BRIDGE_ENDPOINT);
+  if (val === null || val === undefined) return DEFAULT_BRIDGE_ENDPOINT;
+  if (val === "") return "";
+  return normalizeEndpoint(val);
+}
+
+/** Persist the configured Antigravity bridge endpoint ("" disables bridge). */
+export function saveBridgeEndpoint(endpoint: string): void {
+  cacheSet(STORAGE_KEY_BRIDGE_ENDPOINT, normalizeEndpoint(endpoint));
+}
+
+export function loadBridgeTarget(origin: string): BridgeTarget {
+  const map = cacheGet<Record<string, BridgeTarget>>(STORAGE_KEY_BRIDGE_TARGETS);
+  const entry = map && origin ? map[origin] : undefined;
+  if (!entry || (entry.mode !== "existing" && entry.mode !== "new")) {
+    return { mode: "existing" };
+  }
+  return entry;
+}
+
+export function saveBridgeTarget(origin: string, target: BridgeTarget): void {
+  if (!origin) return;
+  const existing =
+    cacheGet<Record<string, BridgeTarget>>(STORAGE_KEY_BRIDGE_TARGETS) || {};
+  cacheSet(STORAGE_KEY_BRIDGE_TARGETS, {
+    ...existing,
+    [origin]: target,
+  });
 }
 
 // ── Toolbar visibility ──────────────────────────────────────────────────────

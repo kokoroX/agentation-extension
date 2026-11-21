@@ -61,13 +61,17 @@ import {
   clearWireframeState,
   loadToolbarHidden,
   saveToolbarHidden,
+  type BridgeTarget,
 } from "../../utils/storage";
+import { submitToAntigravity } from "../../utils/bridge";
+import type { SubmitResult } from "../../shared/messages";
 import {
   createSession,
   getSession,
   syncAnnotation,
   updateAnnotation as updateAnnotationOnServer,
   deleteAnnotation as deleteAnnotationFromServer,
+  checkHealth,
 } from "../../utils/sync";
 import { getReactComponentName } from "../../utils/react-detection";
 import {
@@ -322,6 +326,14 @@ export type PageFeedbackToolbarCSSProps = {
   onSessionCreated?: (sessionId: string) => void;
   /** Webhook URL to receive annotation events. */
   webhookUrl?: string;
+  /** Antigravity Sidecar bridge URL (e.g., "http://127.0.0.1:4748"). */
+  bridgeEndpoint?: string;
+  /** Target Antigravity delivery mode & conversation for the active origin. */
+  bridgeTarget?: BridgeTarget;
+  /** Registers an imperative submit handler for popup-triggered submissions. */
+  onRegisterSubmit?: (
+    handler: ((opts?: { note?: string }) => Promise<SubmitResult>) | null,
+  ) => void;
   /** Custom class name applied to the toolbar container. Use to adjust positioning or z-index. */
   className?: string;
 };
@@ -348,6 +360,9 @@ export function PageFeedbackToolbarCSS({
   sessionId: initialSessionId,
   onSessionCreated,
   webhookUrl,
+  bridgeEndpoint,
+  bridgeTarget,
+  onRegisterSubmit,
   className: userClassName,
 }: PageFeedbackToolbarCSSProps = {}) {
   const [isActive, setIsActive] = useState(false);
@@ -416,6 +431,7 @@ export function PageFeedbackToolbarCSS({
   const [sendState, setSendState] = useState<
     "idle" | "sending" | "sent" | "failed"
   >("idle");
+  const [sendError, setSendError] = useState<string | null>(null);
   const [cleared, setCleared] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
   const [hoveredMarkerId, setHoveredMarkerId] = useState<string | null>(null);
@@ -599,9 +615,19 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
     initialSessionId ?? null,
   );
   const sessionInitializedRef = useRef(false);
+  const prevEndpointRef = useRef(endpoint);
   const [connectionStatus, setConnectionStatus] = useState<
     "disconnected" | "connecting" | "connected"
   >(endpoint ? "connecting" : "disconnected");
+
+  // Re-initialise the session when the endpoint changes (e.g. edited in popup).
+  useEffect(() => {
+    if (prevEndpointRef.current === endpoint) return;
+    prevEndpointRef.current = endpoint;
+    sessionInitializedRef.current = false;
+    setCurrentSessionId(null);
+    setConnectionStatus(endpoint ? "connecting" : "disconnected");
+  }, [endpoint]);
 
   // Draggable toolbar state
   const [toolbarPosition, setToolbarPosition] = useState<{
@@ -969,22 +995,14 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
   useEffect(() => {
     if (!endpoint || !mounted) return;
 
-    const checkHealth = async () => {
-      try {
-        const response = await fetch(`${endpoint}/health`);
-        if (response.ok) {
-          setConnectionStatus("connected");
-        } else {
-          setConnectionStatus("disconnected");
-        }
-      } catch {
-        setConnectionStatus("disconnected");
-      }
+    const runHealthCheck = async () => {
+      const healthy = await checkHealth(endpoint);
+      setConnectionStatus(healthy ? "connected" : "disconnected");
     };
 
     // Check immediately, then every 10 seconds
-    checkHealth();
-    const interval = originalSetInterval(checkHealth, 10000);
+    runHealthCheck();
+    const interval = originalSetInterval(runHealthCheck, 10000);
     return () => clearInterval(interval);
   }, [endpoint, mounted]);
 
@@ -992,15 +1010,14 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
   useEffect(() => {
     if (!endpoint || !mounted || !currentSessionId) return;
 
-    const eventSource = new EventSource(
-      `${endpoint}/sessions/${currentSessionId}/events`
-    );
+    const normalizedEndpoint = endpoint.replace(/\/+$/, "");
+    const eventsUrl = `${normalizedEndpoint}/sessions/${currentSessionId}/events`;
 
     const removedStatuses = ["resolved", "dismissed"];
 
-    const handler = (e: MessageEvent) => {
+    const handleData = (raw: string) => {
       try {
-        const event = JSON.parse(e.data);
+        const event = JSON.parse(raw);
         if (removedStatuses.includes(event.payload?.status)) {
           const id = event.payload.id as string;
           const kind = event.payload.kind as string | undefined;
@@ -1045,6 +1062,38 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
         // Ignore parse errors
       }
     };
+
+    // Prefer the background SSE proxy (works around host-page CSP / https).
+    const canUseProxy =
+      typeof chrome !== "undefined" && !!chrome.runtime?.connect;
+
+    if (canUseProxy) {
+      const port = chrome.runtime.connect({ name: "agentation-sse" });
+
+      port.onMessage.addListener((msg: unknown) => {
+        const message = msg as {
+          type?: string;
+          event?: string;
+          data?: unknown;
+        };
+        if (
+          message?.type === "SSE_EVENT" &&
+          message.event === "annotation.updated" &&
+          typeof message.data === "string"
+        ) {
+          handleData(message.data);
+        }
+      });
+
+      port.postMessage({ type: "SUBSCRIBE", url: eventsUrl });
+
+      return () => {
+        port.disconnect();
+      };
+    }
+
+    const eventSource = new EventSource(eventsUrl);
+    const handler = (e: MessageEvent) => handleData(e.data);
 
     eventSource.addEventListener("annotation.updated", handler);
 
@@ -3162,77 +3211,164 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
     onCopy,
   ]);
 
-  // Send to webhook
-  const sendToWebhook = useCallback(async () => {
-    const displayUrl =
-      typeof window !== "undefined"
-        ? window.location.pathname +
-          window.location.search +
-          window.location.hash
-        : pathname;
-    let output = generateOutput(
-      annotations,
-      displayUrl,
-      settings.outputDetail,
-    );
-    if (!output && designPlacements.length === 0 && !rearrangeState) return;
-    if (!output) output = `## Page Feedback: ${displayUrl}\n`;
-
-    // Append design layout section if there are placements
-    if (designPlacements.length > 0) {
-      output += "\n" + generateDesignOutput(designPlacements, {
-        width: window.innerWidth,
-        height: window.innerHeight,
-      }, { blankCanvas, wireframePurpose: wireframePurpose || undefined }, settings.outputDetail);
-    }
-
-    // Append rearrange section if sections were reordered
-    if (rearrangeState) {
-      const rearrangeOutput = generateRearrangeOutput(rearrangeState, settings.outputDetail, {
-        width: window.innerWidth,
-        height: window.innerHeight,
-      });
-      if (rearrangeOutput) {
-        output += "\n" + rearrangeOutput;
+  // Send to Antigravity bridge (preferred when configured) or webhook
+  const sendToWebhook = useCallback(
+    async (opts?: { note?: string }): Promise<SubmitResult> => {
+      const displayUrl =
+        typeof window !== "undefined"
+          ? window.location.pathname +
+            window.location.search +
+            window.location.hash
+          : pathname;
+      let output = generateOutput(
+        annotations,
+        displayUrl,
+        settings.outputDetail,
+      );
+      if (!output && designPlacements.length === 0 && !rearrangeState) {
+        return { ok: false, error: "No annotations to submit." };
       }
-    }
+      if (!output) output = `## Page Feedback: ${displayUrl}\n`;
 
-    // Fire onSubmit callback
-    if (onSubmit) {
-      onSubmit(output, annotations);
-    }
+      // Append design layout section if there are placements
+      if (designPlacements.length > 0) {
+        output +=
+          "\n" +
+          generateDesignOutput(
+            designPlacements,
+            {
+              width: window.innerWidth,
+              height: window.innerHeight,
+            },
+            { blankCanvas, wireframePurpose: wireframePurpose || undefined },
+            settings.outputDetail,
+          );
+      }
 
-    // Start sending (arrow fades)
-    setSendState("sending");
+      // Append rearrange section if sections were reordered
+      if (rearrangeState) {
+        const rearrangeOutput = generateRearrangeOutput(
+          rearrangeState,
+          settings.outputDetail,
+          {
+            width: window.innerWidth,
+            height: window.innerHeight,
+          },
+        );
+        if (rearrangeOutput) {
+          output += "\n" + rearrangeOutput;
+        }
+      }
 
-    // Brief delay for the fade effect
-    await new Promise((resolve) => originalSetTimeout(resolve, 150));
+      // Fire onSubmit callback
+      if (onSubmit) {
+        onSubmit(output, annotations);
+      }
 
-    // Fire webhook and check result (force=true to bypass webhooksEnabled check for manual sends)
-    const success = await fireWebhook("submit", { output, annotations }, true);
+      const useBridge = isValidUrl(bridgeEndpoint || "");
+      if (useBridge) {
+        const mode = bridgeTarget?.mode ?? "existing";
+        if (mode === "existing" && !bridgeTarget?.conversationId) {
+          const msg =
+            "Please select a target conversation in the Agentation popup first.";
+          setSendError("Select Antigravity chat in popup");
+          setSendState("failed");
+          originalSetTimeout(() => {
+            setSendState("idle");
+            setSendError(null);
+          }, 2500);
+          return { ok: false, error: msg };
+        }
 
-    // Show result
-    setSendState(success ? "sent" : "failed");
-    originalSetTimeout(() => setSendState("idle"), 2500);
+        setSendError(null);
+        setSendState("sending");
+        await new Promise((resolve) => originalSetTimeout(resolve, 150));
 
-    // Clear annotations if send succeeded and autoClearAfterCopy is enabled
-    if (success && settings.autoClearAfterCopy) {
-      originalSetTimeout(() => clearAll(), 500);
-    }
-  }, [
-    onSubmit,
-    fireWebhook,
-    annotations,
-    designPlacements,
-    rearrangeState,
-    blankCanvas,
-    canvasPurpose,
-    pathname,
-    settings.outputDetail,
-    effectiveReactMode,
-    settings.autoClearAfterCopy,
-    clearAll,
-  ]);
+        const result = await submitToAntigravity(bridgeEndpoint!, {
+          mode,
+          projectId: bridgeTarget?.projectId,
+          projectName: bridgeTarget?.projectName,
+          projectFolder: bridgeTarget?.projectFolder,
+          conversationId: bridgeTarget?.conversationId,
+          url: typeof window !== "undefined" ? window.location.href : undefined,
+          pathname,
+          sessionId: currentSessionId,
+          output,
+          annotations: annotations.map((a) => ({
+            id: a.id,
+            comment: a.comment,
+            element: a.element,
+            elementPath: a.elementPath,
+          })),
+          note: opts?.note,
+        });
+
+        setSendState(result.ok ? "sent" : "failed");
+        setSendError(result.ok ? null : result.error || "Failed to send");
+        originalSetTimeout(() => {
+          setSendState("idle");
+          setSendError(null);
+        }, 2500);
+
+        return {
+          ok: result.ok,
+          error: result.error,
+          mode: result.mode ?? mode,
+          conversationId: result.conversationId ?? bridgeTarget?.conversationId ?? null,
+        };
+      }
+
+      // Start sending (arrow fades)
+      setSendError(null);
+      setSendState("sending");
+
+      // Brief delay for the fade effect
+      await new Promise((resolve) => originalSetTimeout(resolve, 150));
+
+      // Fire webhook and check result (force=true to bypass webhooksEnabled check for manual sends)
+      const success = await fireWebhook(
+        "submit",
+        { output, annotations },
+        true,
+      );
+
+      // Show result
+      setSendState(success ? "sent" : "failed");
+      originalSetTimeout(() => setSendState("idle"), 2500);
+
+      // Clear annotations if send succeeded and autoClearAfterCopy is enabled
+      if (success && settings.autoClearAfterCopy) {
+        originalSetTimeout(() => clearAll(), 500);
+      }
+
+      return { ok: success, error: success ? undefined : "Webhook failed" };
+    },
+    [
+      onSubmit,
+      fireWebhook,
+      annotations,
+      designPlacements,
+      rearrangeState,
+      blankCanvas,
+      canvasPurpose,
+      wireframePurpose,
+      pathname,
+      settings.outputDetail,
+      effectiveReactMode,
+      settings.autoClearAfterCopy,
+      clearAll,
+      bridgeEndpoint,
+      bridgeTarget,
+      currentSessionId,
+    ],
+  );
+
+  useEffect(() => {
+    onRegisterSubmit?.(sendToWebhook);
+    return () => {
+      onRegisterSubmit?.(null);
+    };
+  }, [onRegisterSubmit, sendToWebhook]);
 
   // Toolbar dragging - mousemove and mouseup
   useEffect(() => {
@@ -3488,16 +3624,18 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
 
       // "S" to send annotations
       if (e.key === "s" || e.key === "S") {
-        const hasValidWebhook =
-          isValidUrl(settings.webhookUrl) || isValidUrl(webhookUrl || "");
+        const hasValidTarget =
+          isValidUrl(bridgeEndpoint || "") ||
+          isValidUrl(settings.webhookUrl) ||
+          isValidUrl(webhookUrl || "");
         if (
           annotations.length > 0 &&
-          hasValidWebhook &&
+          hasValidTarget &&
           sendState === "idle"
         ) {
           e.preventDefault();
           hideTooltipsUntilMouseLeave();
-          sendToWebhook();
+          void sendToWebhook();
         }
       }
     };
@@ -3513,6 +3651,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
     rearrangeState,
     pendingAnnotation,
     annotations.length,
+    bridgeEndpoint,
     settings.webhookUrl,
     webhookUrl,
     sendState,
@@ -3527,6 +3666,26 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
   if (isToolbarHidden) return null;
 
   const hasAnnotations = annotations.length > 0;
+  const hasBridgeTarget = isValidUrl(bridgeEndpoint || "");
+  const hasWebhookTarget =
+    !settings.webhooksEnabled &&
+    (isValidUrl(settings.webhookUrl) || isValidUrl(webhookUrl || ""));
+  const canSend = hasBridgeTarget || hasWebhookTarget;
+  const truncatedTitle =
+    bridgeTarget?.conversationTitle && bridgeTarget.conversationTitle.length > 26
+      ? `${bridgeTarget.conversationTitle.slice(0, 25)}…`
+      : bridgeTarget?.conversationTitle;
+  const sendTooltipLabel = sendError
+    ? sendError
+    : hasBridgeTarget
+      ? bridgeTarget?.mode === "new"
+        ? bridgeTarget?.projectName
+          ? `Send to Antigravity (New · ${bridgeTarget.projectName})`
+          : "Send to Antigravity (New Chat)"
+        : truncatedTitle
+          ? `Send to: ${truncatedTitle}`
+          : "Select Antigravity chat in popup"
+      : "Send Annotations";
 
   // Filter annotations for rendering (exclude exiting ones from normal flow)
   const visibleAnnotations = annotations.filter(
@@ -3603,7 +3762,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
       >
         {/* Morphing container */}
         <div
-          className={`${styles.toolbarContainer} ${isActive ? styles.expanded : styles.collapsed} ${showEntranceAnimation ? styles.entrance : ""} ${isToolbarHiding ? styles.hiding : ""} ${!settings.webhooksEnabled && (isValidUrl(settings.webhookUrl) || isValidUrl(webhookUrl || "")) ? styles.serverConnected : ""}`}
+          className={`${styles.toolbarContainer} ${isActive ? styles.expanded : styles.collapsed} ${showEntranceAnimation ? styles.entrance : ""} ${isToolbarHiding ? styles.hiding : ""} ${canSend ? styles.serverConnected : ""}`}
           onClick={
             !isActive
               ? (e) => {
@@ -3756,30 +3915,20 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
               </span>
             </div>
 
-            {/* Send button - only visible when webhook URL is available AND auto-send is off */}
+            {/* Send button - visible when Antigravity bridge is configured OR webhook URL is available AND auto-send is off */}
             <div
-              className={`${styles.buttonWrapper} ${styles.sendButtonWrapper} ${isActive && !settings.webhooksEnabled && (isValidUrl(settings.webhookUrl) || isValidUrl(webhookUrl || "")) ? styles.sendButtonVisible : ""}`}
+              className={`${styles.buttonWrapper} ${styles.sendButtonWrapper} ${isActive && canSend ? styles.sendButtonVisible : ""}`}
             >
               <button
                 className={`${styles.controlButton} ${sendState === "sent" || sendState === "failed" ? styles.statusShowing : ""}`}
                 onClick={(e) => {
                   e.stopPropagation();
                   hideTooltipsUntilMouseLeave();
-                  sendToWebhook();
+                  void sendToWebhook();
                 }}
-                disabled={
-                  !hasAnnotations ||
-                  (!isValidUrl(settings.webhookUrl) &&
-                    !isValidUrl(webhookUrl || "")) ||
-                  sendState === "sending"
-                }
+                disabled={!hasAnnotations || !canSend || sendState === "sending"}
                 data-no-hover={sendState === "sent" || sendState === "failed"}
-                tabIndex={
-                  isValidUrl(settings.webhookUrl) ||
-                  isValidUrl(webhookUrl || "")
-                    ? 0
-                    : -1
-                }
+                tabIndex={canSend ? 0 : -1}
               >
                 <IconSendArrow size={24} state={sendState} />
                 {hasAnnotations && sendState === "idle" && (
@@ -3791,7 +3940,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
                 )}
               </button>
               <span className={styles.buttonTooltip}>
-                Send Annotations
+                {sendTooltipLabel}
                 <span className={styles.shortcut}>S</span>
               </span>
             </div>
@@ -4012,6 +4161,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
             isDevMode={isDevMode}
             connectionStatus={connectionStatus}
             endpoint={endpoint}
+            bridgeEndpoint={bridgeEndpoint}
             isVisible={showSettingsVisible}
             toolbarNearBottom={!!toolbarPosition && toolbarPosition.y < 230}
             settingsPage={settingsPage}
